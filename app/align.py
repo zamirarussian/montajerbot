@@ -199,12 +199,21 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
         utoks = [ntok(w["w"]) for w in u["words"]]
         if kind == "stem":
             # oldidagi ortiqcha so'zlarni (mavzu nomi, "второе") kesib tashlash
-            stoks = [ntok(w) for w in ph["stem"].split() if ntok(w)]
+            # (Whisper vaqtiga ishonmaymiz: bo'g'in soni bo'yicha bo'lamiz)
+            stem_words = [w for w in ph["stem"].split() if ntok(w)]
+            stoks = [ntok(w) for w in stem_words]
             pairs = _tok_match(utoks, stoks)
             if pairs:
                 ui = min(pp[0] for pp in pairs)
                 if ui > 0:
-                    ev["s"] = round(max(u["s"], u["words"][ui]["s"] - 0.1), 3)
+                    allw = [w["w"] for w in u["words"]]
+                    frac = sum(_syl(w) for w in allw[:ui]) / sum(_syl(w) for w in allw)
+                    ev["s"] = round(u["s"] + dur * frac - 0.05, 3)
+            else:
+                # so'zlar tanilmadi: qolipning taxminiy davomiyligidan foydalanamiz
+                est = 0.35 + 0.19 * sum(_syl(w) for w in stem_words)
+                if dur > est * 1.6:
+                    ev["s"] = round(u["e"] - est, 3)
         else:
             lo, hi = 0, n
             pairs = _tok_match(utoks, ph["toks"]) if utoks else []
