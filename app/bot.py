@@ -5,7 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
-from .align import build_plan, summary, transcribe_groq, utterances_from_words
+from .align import build_plan, speech_intervals, summary, transcribe_groq, utterances_from_intervals
 from .render import render
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -99,7 +99,8 @@ async def process(update: Update, ctx: ContextTypes.DEFAULT_TYPE, day, level):
     try:
         words = await asyncio.to_thread(transcribe_groq, path)
         dur = await asyncio.to_thread(audio_duration, path)
-        plan = build_plan(utterances_from_words(words), data, day, dur)
+        intervals = await asyncio.to_thread(speech_intervals, path)
+        plan = build_plan(utterances_from_intervals(words, intervals), data, day, dur)
     except Exception as e:
         log.exception("align")
         await status.edit_text(f"❌ Audioni tahlil qilib bo'lmadi: {e}")

@@ -65,6 +65,58 @@ def utterances_from_words(words, gap=GAP):
     return [dict(s=u[0]["s"], e=u[-1]["e"], words=u, text=" ".join(x["w"] for x in u)) for u in utts]
 
 
+def load_pcm16k(path):
+    import numpy as np
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                         capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+
+
+def speech_intervals(path, min_sil=0.4, min_speech=0.25):
+    """Audio energiyasi bo'yicha gaplar chegarasi (Whisper vaqtlaridan ancha aniq)."""
+    import numpy as np
+    a = load_pcm16k(path)
+    hop = 160  # 10 ms
+    n = len(a) // hop
+    fr = a[: n * hop].reshape(n, hop)
+    db = 20 * np.log10(np.sqrt((fr ** 2).mean(1)) + 1e-9)
+    floor = np.percentile(db, 10)
+    peak = np.percentile(db, 98)
+    thr = max(floor + 12, peak - 32)
+    sp = db > thr
+    segs, i = [], 0
+    while i < n:
+        if sp[i]:
+            j = i
+            while j < n and sp[j]:
+                j += 1
+            segs.append([i * 0.01, j * 0.01]); i = j
+        else:
+            i += 1
+    merged = []
+    for s_, e_ in segs:
+        if merged and s_ - merged[-1][1] < min_sil:
+            merged[-1][1] = e_
+        else:
+            merged.append([s_, e_])
+    return [(round(s_, 3), round(e_, 3)) for s_, e_ in merged if e_ - s_ >= min_speech]
+
+
+def utterances_from_intervals(words, intervals):
+    """Har bir audio-gapga Whisper so'zlarini (o'rta nuqtasi bo'yicha) biriktirish."""
+    utts = [dict(s=s_, e=e_, words=[]) for s_, e_ in intervals]
+    for w in words:
+        if not norm(w["w"]) or not utts:
+            continue
+        m = (w["s"] + w["e"]) / 2
+        best = min(utts, key=lambda u: 0 if u["s"] - 0.15 <= m <= u["e"] + 0.15 else min(abs(m - u["s"]), abs(m - u["e"])))
+        if best["s"] - 0.6 <= m <= best["e"] + 0.6:
+            best["words"].append(w)
+    for u in utts:
+        u["text"] = " ".join(x["w"] for x in u["words"])
+    return utts
+
+
 # ---------------- moslash ----------------
 def _ratio(a, b):
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
@@ -81,6 +133,27 @@ def _tok_match(utt_toks, sent_toks):
     return pairs
 
 
+VOWELS = set("аеёиоуыэюяaeiou")
+
+
+def _syl(w):
+    """so'z og'irligi: unli harflar soni (bo'g'in) + tinish belgisidan keyingi pauza."""
+    n = sum(1 for c in w.lower() if c in VOWELS)
+    return max(1, n) + (0.6 if w[-1:] in ",.!?…;:" else 0)
+
+
+def prop_times(words, lo, hi, s, e):
+    """[s, e] oralig'ini so'zlarga bo'g'in soniga qarab taqsimlash."""
+    wt = [None] * len(words)
+    ws = [_syl(words[i]) for i in range(lo, hi)]
+    tot = sum(ws); t = s
+    for k, i in enumerate(range(lo, hi)):
+        d = (e - s) * ws[k] / tot
+        wt[i] = [round(t, 3), round(t + d, 3)]
+        t += d
+    return wt
+
+
 def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
     phrases = []
     for p in day_data["phrases"]:
@@ -90,57 +163,65 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
                             sent=sent, uz=clean_display(p["uz"]), words=words,
                             toks=[ntok(w) or w for w in words], ev=[]))
     cur = 0
+    last_ex = None  # (k, davomiylik) oxirgi to'liq misol
     for u in utts:
         un = norm(u["text"])
-        if not un:
-            continue
+        dur = u["e"] - u["s"]
         best = None
-        for k in range(cur, min(cur + 2, len(phrases))):
-            ph = phrases[k]
-            rs = _ratio(un, norm(ph["stem"]))
-            rf = _ratio(un, norm(ph["sent"]))
-            sc, kind = (rs, "stem") if rs >= rf else (rf, "ex")
-            # keyingi iboraga o'tish uchun biroz yuqoriroq ishonch talab qilamiz
-            if k > cur:
-                sc -= 0.05
-            if best is None or sc > best[0]:
-                best = (sc, k, kind)
+        if un:
+            for k in range(cur, min(cur + 2, len(phrases))):
+                ph = phrases[k]
+                rs = _ratio(un, norm(ph["stem"]))
+                rf = _ratio(un, norm(ph["sent"]))
+                sc, kind = (rs, "stem") if rs >= rf else (rf, "ex")
+                if k > cur:
+                    sc -= 0.05
+                if best is None or sc > best[0]:
+                    best = (sc, k, kind)
+        if (best is None or best[0] < min_score) and un:
+            # gapning bir bo'lagi ("на автобусе"): so'zlarning ko'pi joriy misolda bor
+            ut = [ntok(w["w"]) for w in u["words"] if ntok(w["w"])]
+            ph = phrases[cur]
+            if ut and len(_tok_match(ut, ph["toks"])) / len(ut) >= 0.75:
+                best = (1.0, cur, "ex")
         if best is None or best[0] < min_score:
-            continue
+            # Whisper takrorni tashlab ketgan bo'lishi mumkin: oldingi misolga
+            # davomiyligi o'xshash bo'lsa, uni o'sha misolning takrori deb olamiz.
+            if last_ex and last_ex[0] == cur and 0.6 <= dur / last_ex[1] <= 1.7:
+                best = (1.0, cur, "ex")
+            else:
+                continue
         _, k, kind = best
         cur = k
         ph = phrases[k]
-        ev = dict(s=u["s"], e=u["e"], kind=kind, span=None, wt=None)
-        if kind == "ex":
-            utoks = [ntok(w["w"]) for w in u["words"]]
-            pairs = _tok_match(utoks, ph["toks"])
+        n = len(ph["words"])
+        ev = dict(s=round(u["s"], 3), e=round(u["e"], 3), kind=kind, span=None, wt=None)
+        utoks = [ntok(w["w"]) for w in u["words"]]
+        if kind == "stem":
+            # oldidagi ortiqcha so'zlarni (mavzu nomi, "второе") kesib tashlash
+            stoks = [ntok(w) for w in ph["stem"].split() if ntok(w)]
+            pairs = _tok_match(utoks, stoks)
             if pairs:
-                lo = min(p[1] for p in pairs); hi = max(p[1] for p in pairs) + 1
-                n = len(ph["toks"])
-                if hi - lo < 0.85 * n:
+                ui = min(pp[0] for pp in pairs)
+                if ui > 0:
+                    ev["s"] = round(max(u["s"], u["words"][ui]["s"] - 0.1), 3)
+        else:
+            lo, hi = 0, n
+            pairs = _tok_match(utoks, ph["toks"]) if utoks else []
+            if pairs:
+                a = min(pp[1] for pp in pairs); b = max(pp[1] for pp in pairs) + 1
+                if b - a < 0.85 * n:
+                    lo, hi = a, b
                     ev["span"] = [lo, hi]
-                else:
-                    lo, hi = 0, n
-                # har bir gap so'zining boshlanish/tugash vaqti
-                wt = [None] * n
-                for ui, si in pairs:
-                    wt[si] = [u["words"][ui]["s"], u["words"][ui]["e"]]
-                known = [i for i in range(lo, hi) if wt[i]]
-                if len(known) >= 2:
-                    for i in range(lo, hi):
-                        if wt[i] is None:
-                            before = [j for j in known if j < i]
-                            after = [j for j in known if j > i]
-                            a = wt[before[-1]][1] if before else u["s"]
-                            b = wt[after[0]][0] if after else u["e"]
-                            wt[i] = [a, b]
-                    ev["wt"] = wt
+            if ev["span"] is None:
+                last_ex = (k, dur)
+            ev["wt"] = prop_times(ph["words"], lo, hi, ev["s"], ev["e"])
         ph["ev"].append(ev)
 
     # sahnalar boshlanishi
     found = [i for i, p in enumerate(phrases) if p["ev"]]
     first_t = phrases[found[0]]["ev"][0]["s"] if found else 0
-    intro_end = max(2.5, first_t - 0.7) if first_t > 2.0 else 0.0
+    intro_end = round(first_t - 0.4, 2) if first_t > 1.6 else 0.0
     scenes, prev_end = [], intro_end
     for i, ph in enumerate(phrases):
         if not ph["ev"]:
