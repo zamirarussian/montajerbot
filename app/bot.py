@@ -10,6 +10,8 @@ from .render import render
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("shadowing")
+# httpx har bir so'rov URL'ini (ichida bot tokeni bor) logga yozmasin
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHRASES = json.load(open(os.path.join(BASE, "data", "phrases.json"), encoding="utf-8"))
