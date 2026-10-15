@@ -1,0 +1,5 @@
+python-telegram-bot==21.6
+numpy>=1.26
+pillow>=10.4
+soundfile>=0.12
+requests>=2.31
