@@ -376,6 +376,19 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
             ev["wt"] = prop_times(ph["words"], lo, hi, ev["s"], ev["e"])
         ph["ev"].append(ev)
 
+    # qolip va misol bir xil bo'lsa ("Счёт, пожалуйста."): birinchisi qolip, qolganlari misol
+    for ph in phrases:
+        if ph["ev"] and norm(ph["stem"]) == norm(ph["sent"]):
+            ph["ev"].sort(key=lambda e: e["s"])
+            for i, ev in enumerate(ph["ev"]):
+                if ev.get("text"):
+                    continue
+                if i == 0:
+                    ev.update(kind="stem", span=None, wt=None)
+                else:
+                    ev.update(kind="ex", span=None)
+                    ev["wt"] = prop_times(ph["words"], 0, len(ph["words"]), ev["s"], ev["e"])
+
     # sahnalar boshlanishi
     found = [i for i, p in enumerate(phrases) if p["ev"]]
     first_t = phrases[found[0]]["ev"][0]["s"] if found else 0
