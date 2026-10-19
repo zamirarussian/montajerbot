@@ -154,6 +154,81 @@ def prop_times(words, lo, hi, s, e):
     return wt
 
 
+def stem_prefix(stem):
+    """Qolipning '…' dan oldingi birinchi 1-2 so'zi (gap boshlanishini tanish uchun)."""
+    head = re.split(r"[…]|\.\.\.", stem)[0]
+    toks = [ntok(w) for w in head.split() if ntok(w)]
+    return toks[:2]
+
+
+def find_prefix(utoks, pref):
+    if not pref:
+        return []
+    n = len(pref)
+    return [i for i in range(len(utoks) - n + 1)
+            if all(utoks[i + j][:4] == pref[j][:4] for j in range(n))]
+
+
+def _sub_utt(u, a, b):
+    """u ning a..b so'zlaridan iborat bo'lak; vaqt bo'g'in soniga qarab."""
+    ws = u["words"]
+    syl = [_syl(w["w"]) for w in ws]
+    tot = sum(syl) or 1
+    dur = u["e"] - u["s"]
+    s_ = u["s"] + dur * sum(syl[:a]) / tot
+    e_ = u["s"] + dur * sum(syl[:b]) / tot
+    part = ws[a:b]
+    return dict(s=round(s_, 3), e=round(e_, 3), words=part, text=" ".join(w["w"] for w in part))
+
+
+def _merge(a, b):
+    return dict(s=a["s"], e=b["e"], words=a["words"] + b["words"],
+                text=(a["text"] + " " + b["text"]).strip())
+
+
+def merge_fragments(utts, score):
+    """Bitta so'zli mayda bo'laklarni ("Мне" / "45" / "лет") qo'shni gapga qo'shish."""
+    def frag(u):
+        return len(u["words"]) <= 1 and u["e"] - u["s"] < 0.9
+    # 1) ketma-ket bo'laklarni birlashtirish
+    out = []
+    for u in utts:
+        if out and frag(u) and frag(out[-1]) and u["s"] - out[-1]["e"] < 0.8 and u["words"] and out[-1]["words"]:
+            out[-1] = _merge(out[-1], u)
+        else:
+            out.append(dict(u))
+    # 2) yolg'iz bo'lakni qaysi qo'shniga qo'shish foydaliroq bo'lsa, o'shanga
+    i = 0
+    while i < len(out):
+        u = out[i]
+        if frag(u) and u["words"]:
+            best, gain = None, 0.02
+            if i > 0 and u["s"] - out[i - 1]["e"] < 0.8:
+                g = score(_merge(out[i - 1], u)["text"]) - score(out[i - 1]["text"])
+                if g > gain:
+                    best, gain = "prev", g
+            if i + 1 < len(out) and out[i + 1]["s"] - u["e"] < 0.8:
+                g = score(_merge(u, out[i + 1])["text"]) - score(out[i + 1]["text"])
+                if g > gain:
+                    best, gain = "next", g
+            if best == "prev":
+                out[i - 1] = _merge(out[i - 1], u); out.pop(i); continue
+            if best == "next":
+                out[i + 1] = _merge(u, out[i + 1]); out.pop(i); continue
+        i += 1
+    return out
+
+
+def display_text(words):
+    t = " ".join(w["w"].strip() for w in words).strip()
+    t = re.sub(r"\s+([,.!?…])", r"\1", t)
+    if t:
+        t = t[0].upper() + t[1:]
+        if t[-1] not in ".!?…":
+            t += "."
+    return t
+
+
 def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
     phrases = []
     for p in day_data["phrases"]:
@@ -162,9 +237,32 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
         phrases.append(dict(stem=clean_display(p["stem"]), stem_uz=clean_display(p["stem_uz"]),
                             sent=sent, uz=clean_display(p["uz"]), words=words,
                             toks=[ntok(w) or w for w in words], ev=[]))
+    for ph in phrases:
+        ph["pref"] = stem_prefix(ph["stem"])
+        ph["stoks"] = [ntok(w) for w in ph["stem"].split() if ntok(w)]
+
+    def score(text):
+        t = norm(text)
+        return max([0] + [max(_ratio(t, norm(ph["stem"])), _ratio(t, norm(ph["sent"]))) for ph in phrases])
+
+    queue = merge_fragments(list(utts), score)
     cur = 0
     last_ex = None  # (k, davomiylik) oxirgi to'liq misol
-    for u in utts:
+    while queue:
+        u = queue.pop(0)
+        # bir nafasda aytilgan ikki gap ("Я работаю. Я работаю в школе.", "Мне 31 год Мне 22 года")
+        utoks0 = [ntok(w["w"]) for w in u["words"]]
+        cuts = []
+        for k in range(cur, min(cur + 2, len(phrases))):
+            occ = find_prefix(utoks0, phrases[k]["pref"])
+            if len(occ) >= 2:
+                cuts = occ[1:]
+                break
+        if cuts:
+            bounds = [0] + cuts + [len(u["words"])]
+            parts = [_sub_utt(u, a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+            queue = parts + queue
+            continue
         un = norm(u["text"])
         dur = u["e"] - u["s"]
         best = None
@@ -178,6 +276,47 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
                     sc -= 0.05
                 if best is None or sc > best[0]:
                     best = (sc, k, kind)
+        variant = None
+        if un and (best is None or best[0] < 0.8):
+            # qolip bilan boshlanadigan gap: qolipning o'zi yoki jadvaldan boshqa misol
+            utoks1 = [ntok(w["w"]) for w in u["words"]]
+            for k in range(cur, min(cur + 2, len(phrases))):
+                ph = phrases[k]
+                occ = find_prefix(utoks1, ph["pref"])
+                if not occ:
+                    continue
+                p0 = occ[0]
+                sk = {t[:4] for t in ph["stoks"]}
+                extra = [t for t in utoks1[p0:] if t[:4] not in sk]
+                if not extra:
+                    best = (1.0, k, "stem")
+                else:
+                    tail = " ".join(utoks1[p0:])
+                    part = utoks1[p0:]
+                    is_part = len(_tok_match(part, ph["toks"])) >= 0.9 * len(part) and not any(
+                        t.isdigit() and t not in ph["toks"] for t in part)
+                    if is_part or _ratio(tail, norm(ph["sent"])) >= 0.75:
+                        best = (1.0, k, "ex")
+                    else:
+                        best = (1.0, k, "ex"); variant = p0
+                break
+        if best is not None and un:
+            k0 = best[1]; ph0 = phrases[k0]
+            utoks2 = [ntok(w["w"]) for w in u["words"] if ntok(w["w"])]
+            sent4 = [t[:4] for t in ph0["toks"]]
+            # so'zlari jadvaldagi gapniki, lekin tartibi boshqa ("Я в школе работаю")
+            if best[2] == "stem" and len(utoks2) > len(ph0["stoks"]):
+                cov = sum(1 for t in set(sent4) if t in {x[:4] for x in utoks2}) / max(1, len(set(sent4)))
+                if cov >= 0.85:
+                    best = (best[0], k0, "ex")
+                    if len(_tok_match(utoks2, ph0["toks"])) < 0.85 * len(sent4):
+                        variant = 0
+            # raqami boshqa ("Мне 45 лет" jadvalda "Мне 25 лет")
+            if best[2] == "ex" and variant is None:
+                nums_u = [t for t in utoks2 if t.isdigit()]
+                if nums_u and any(t not in ph0["toks"] for t in nums_u):
+                    occ = find_prefix(utoks2, ph0["pref"])
+                    variant = occ[0] if occ else 0
         if (best is None or best[0] < min_score) and un:
             # gapning bir bo'lagi ("на автобусе"): so'zlarning ko'pi joriy misolda bor
             ut = [ntok(w["w"]) for w in u["words"] if ntok(w["w"])]
@@ -214,6 +353,16 @@ def build_plan(utts, day_data, day, audio_dur, min_score=0.5):
                 est = 0.35 + 0.19 * sum(_syl(w) for w in stem_words)
                 if dur > est * 1.6:
                     ev["s"] = round(u["e"] - est, 3)
+        elif variant is not None:
+            # diktor jadvaldagidan boshqa misol aytdi: ekranda aytilganini ko'rsatamiz
+            if variant > 0:
+                sub = _sub_utt(u, variant, len(u["words"]))
+                ev["s"] = sub["s"]
+            vw = u["words"][variant:]
+            ev["text"] = display_text(vw)
+            ev["uz"] = ph["stem_uz"]
+            words_v = ev["text"].split()
+            ev["wt"] = prop_times(words_v, 0, len(words_v), ev["s"], ev["e"])
         else:
             lo, hi = 0, n
             pairs = _tok_match(utoks, ph["toks"]) if utoks else []
@@ -261,4 +410,7 @@ def summary(plan):
         if ex < 1:
             ok = False
         lines.append(f"{mark} {n}. {s['sent']}  (qolip: {st}, misol: {ex} marta, {s['ev'][0]['s']:.0f}s dan)")
+        var = [e["text"] for e in s["ev"] if e.get("text")]
+        if var:
+            lines.append("      boshqa misollar: " + "; ".join(dict.fromkeys(var)))
     return ok, "\n".join(lines)

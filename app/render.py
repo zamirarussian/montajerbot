@@ -215,6 +215,7 @@ def render(audio_path, plan, out_path, progress=None, only_frames=None, layout_n
                 uz=fit_line(sc["uz"], L["uzw"], L["uz"]), stem_uz=fit_line(sc["stem_uz"], L["uzw"], L["uz"]))
         blinks = [b + 0.6 * math.sin(b * 7) for b in np.arange(1.7, dur, 3.9)]
         nf, ns = L["num"]
+        var_cache = {}
 
         def scene_at(t):
             cur = None
@@ -265,8 +266,19 @@ def render(audio_path, plan, out_path, progress=None, only_frames=None, layout_n
                 Lr.alpha_composite(fade(S, 1 - mix), (0, int(-30 * mix)))
             if mix > 0:
                 E = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                lay = p["sent"][1]
                 sp = [e for e in speaking if e["kind"] == "ex"]
+                # hozirgi (yoki oxirgi aytilgan) misol: diktor boshqa misol aytgan bo'lsa, o'sha matn
+                started = [e for e in exs if e["s"] <= t]
+                cur_ev = sp[0] if sp else (started[-1] if started else None)
+                if cur_ev is not None and cur_ev.get("text"):
+                    key = cur_ev["text"]
+                    if key not in var_cache:
+                        var_cache[key] = (fit(key, L["maxw"], L["sent"], L["maxlines"]),
+                                          fit_line(cur_ev.get("uz") or "", L["uzw"], L["uz"]))
+                    sent_fit, uz_fit = var_cache[key]
+                else:
+                    sent_fit, uz_fit = p["sent"], p["uz"]
+                lay = sent_fit[1]
                 mark = None
                 if sp:
                     st = word_state(t, sp[0], len(lay)) or word_state_prop(t, sp[0], [w[3] for w in lay], len(lay))
@@ -275,7 +287,7 @@ def render(audio_path, plan, out_path, progress=None, only_frames=None, layout_n
                     mark = (act, frac)
                 else:
                     cols = [DARK] * len(lay)
-                block(E, p["sent"], p["uz"], cols, mark)
+                block(E, sent_fit, uz_fit, cols, mark)
                 Lr.alpha_composite(fade(E, mix), (0, int(30 * (1 - mix))))
             return Lr
 
